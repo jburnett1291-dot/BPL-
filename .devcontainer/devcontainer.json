@@ -1,33 +1,161 @@
-{
-  "name": "Python 3",
-  // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
-  "customizations": {
-    "codespaces": {
-      "openFiles": [
-        "README.md",
-        "app.py"
-      ]
-    },
-    "vscode": {
-      "settings": {},
-      "extensions": [
-        "ms-python.python",
-        "ms-python.vscode-pylance"
-      ]
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from streamlit_gsheets import GSheetsConnection
+
+# 1. UI & SPAM HUB PREMIUM CSS
+st.set_page_config(page_title="BPL PRO | SPAM HUB", page_icon="🏀", layout="wide")
+
+st.markdown("""
+    <style>
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
+    div[data-testid="stToolbar"] {visibility: hidden;} [data-testid="stStatusWidget"] {display: none;}
+    .block-container { padding: 0rem !important; margin: 0rem !important; }
+    .stApp { background: radial-gradient(circle at top, #1f1f1f 0%, #050505 100%); color: #e0e0e0; }
+    div[data-testid="stMetric"] { 
+        background: rgba(255, 255, 255, 0.05) !important; 
+        backdrop-filter: blur(10px);
+        border: 1px solid #00a2ff !important; 
+        border-radius: 20px !important; padding: 20px !important;
     }
-  },
-  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
-  "postAttachCommand": {
-    "server": "streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false"
-  },
-  "portsAttributes": {
-    "8501": {
-      "label": "Application",
-      "onAutoForward": "openPreview"
+    .header-banner { 
+        padding: 25px; text-align: center; 
+        background: linear-gradient(90deg, #0056b3 0%, #00a2ff 50%, #0056b3 100%);
+        color: white; font-family: 'Arial Black'; font-size: 28px;
     }
-  },
-  "forwardPorts": [
-    8501
-  ]
-}
+    @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
+    .ticker-wrap { width: 100%; overflow: hidden; background: #000; color: #00a2ff; padding: 12px 0; border-bottom: 1px solid #333; }
+    .ticker-content { display: inline-block; white-space: nowrap; animation: ticker 45s linear infinite; }
+    .ticker-item { display: inline-block; margin-right: 100px; font-weight: bold; font-size: 16px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# 2. DATA ENGINE
+@st.cache_data(ttl=60)
+def load_data():
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        df = conn.read(spreadsheet="https://docs.google.com/spreadsheets/d/1Q5Q7_bk2RyNqJMbrYY5_VzDaPYhlEbQxqXA3BnYFBJU/edit#gid=0", ttl="1m")
+        df.columns = df.columns.str.strip()
+        
+        # Numeric Sanitization
+        num_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FGA', 'FGM', '3PM', '3PA', 'Game_ID', 'Win', 'Season']
+        for c in num_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+            else:
+                df[c] = 0
+        
+        df['is_ff'] = (df['PTS'] == 0) & (df['FGA'] == 0)
+        df['PIE_Raw'] = (df['PTS'] + df['REB'] + df['AST'] + df['STL'] + df['BLK']) - (df['FGA'] * 0.5)
+        return df
+    except Exception as e:
+        return str(e)
+
+full_df = load_data()
+
+# 3. SPAM STATS LOGIC
+def get_stats(dataframe, group_col):
+    if dataframe.empty: return pd.DataFrame()
+    
+    # Calculate GP (Filtering out forfeits for averages)
+    played_df = dataframe[dataframe['is_ff'] == False]
+    gp = dataframe.groupby(group_col).size().reset_index(name='GP')
+    played_gp = played_df.groupby(group_col).size().reset_index(name='Played_GP')
+    
+    sums = dataframe.groupby(group_col).sum(numeric_only=True).reset_index()
+    m = pd.merge(sums, gp, on=group_col)
+    m = pd.merge(m, played_gp, on=group_col, how='left').fillna(0)
+    
+    divisor = m['Played_GP'].replace(0, 1)
+    for col in ['PTS', 'REB', 'AST', 'STL', 'BLK', 'PIE_Raw']:
+        m[f'{col}/G'] = (m[col] / divisor).round(2)
+        
+    m['FG%'] = (m['FGM'] / m['FGA'].replace(0, 1) * 100).round(1)
+    m['PIE'] = m['PIE_Raw/G']
+    return m
+
+# 4. DIALOG CARD
+@st.dialog("🏀 SCOUTING REPORT", width="large")
+def show_card(name, stats_df, is_player=True):
+    row = stats_df.set_index(stats_df.columns[0]).loc[name]
+    st.title(f"{'👤' if is_player else '🏘️'} {name}")
+    cols = st.columns(4)
+    cols[0].metric("PPG", row['PTS/G'])
+    cols[1].metric("RPG", row['REB/G'])
+    cols[2].metric("APG", row['AST/G'])
+    cols[3].metric("PIE", row['PIE'])
+    if st.button("Close Card", use_container_width=True): st.rerun()
+
+# 5. MAIN APP
+if isinstance(full_df, str):
+    st.error(f"Connection Error: {full_df}")
+else:
+    # --- TIER SELECTION (The 3 Tabs Requirement) ---
+    st.sidebar.title("🎚️ LEAGUE LEVEL")
+    tier = st.sidebar.radio("Select Tier", ["🏫 HIGH SCHOOL", "🎓 COLLEGE", "🏆 PRO"], index=2)
+    
+    if tier == "🏫 HIGH SCHOOL":
+        df_tier = full_df[full_df['Game_ID'].between(1, 999)]
+    elif tier == "🎓 COLLEGE":
+        df_tier = full_df[full_df['Game_ID'].between(1000, 2999)]
+    else:
+        df_tier = full_df[full_df['Game_ID'].between(3000, 5000)]
+
+    # Calculate Stats for the selected Tier
+    p_stats = get_stats(df_tier[df_tier['Type'].str.lower() == 'player'], 'Player/Team')
+    t_stats = get_stats(df_tier[df_tier['Type'].str.lower() == 'team'], 'Team Name')
+
+    # Ticker
+    if not p_stats.empty:
+        leads = [f"🔥 {c}: {p_stats.nlargest(1, f'{c}/G').iloc[0]['Player/Team']} ({p_stats.nlargest(1, f'{c}/G').iloc[0][f'{c}/G']})" for c in ['PTS', 'AST', 'REB']]
+        st.markdown(f'<div class="ticker-wrap"><div class="ticker-content"><span class="ticker-item">{" • ".join(leads)}</span></div></div>', unsafe_allow_html=True)
+
+    st.markdown(f'<div class="header-banner">🏀 BPL HUB - {tier}</div>', unsafe_allow_html=True)
+
+    tabs = st.tabs(["👤 PLAYERS", "🏘️ STANDINGS", "🔝 LEADERS", "⚔️ VERSUS"])
+
+    with tabs[0]:
+        if not p_stats.empty:
+            p_disp = p_stats[['Player/Team', 'GP', 'PTS/G', 'AST/G', 'REB/G', 'FG%', 'PIE']].sort_values('PIE', ascending=False)
+            sel_p = st.dataframe(p_disp, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"p_df_{tier}")
+            if len(sel_p.selection.rows) > 0:
+                show_card(p_disp.iloc[sel_p.selection.rows[0]]['Player/Team'], p_stats, True)
+        else:
+            st.info("No Player data found for this Tier.")
+
+    with tabs[1]:
+        if not t_stats.empty:
+            t_stats['Record'] = t_stats['Win'].astype(int).astype(str) + "-" + (t_stats['GP'] - t_stats['Win']).astype(int).astype(str)
+            t_disp = t_stats[['Team Name', 'Record', 'PTS/G', 'REB/G', 'AST/G', 'PIE']].sort_values('PIE', ascending=False)
+            sel_t = st.dataframe(t_disp, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"t_df_{tier}")
+            if len(sel_t.selection.rows) > 0:
+                show_card(t_disp.iloc[sel_t.selection.rows[0]]['Team Name'], t_stats, False)
+        else:
+            st.info("No Team data found for this Tier.")
+
+    with tabs[2]:
+        if not p_stats.empty:
+            l_cat = st.selectbox("Category", ["PTS/G", "REB/G", "AST/G", "PIE"])
+            t10 = p_stats.nlargest(10, l_cat)
+            st.plotly_chart(px.bar(t10, x=l_cat, y='Player/Team', orientation='h', template="plotly_dark", color_discrete_sequence=['#00a2ff']), use_container_width=True)
+
+    with tabs[3]:
+        if not p_stats.empty and len(p_stats) >= 2:
+            c1, c2 = st.columns(2)
+            p1 = c1.selectbox("Player 1", p_stats['Player/Team'], index=0)
+            p2 = c2.selectbox("Player 2", p_stats['Player/Team'], index=1)
+            
+            d1 = p_stats[p_stats['Player/Team'] == p1].iloc[0]
+            d2 = p_stats[p_stats['Player/Team'] == p2].iloc[0]
+            
+            for met in ['PTS/G', 'AST/G', 'REB/G', 'PIE']:
+                v1, v2 = d1[met], d2[met]
+                col1, col2, col3 = st.columns([2,1,2])
+                col1.metric(p1, v1, round(v1-v2, 2))
+                col2.markdown(f"<div style='text-align:center; padding-top:10px;'>{met}</div>", unsafe_allow_html=True)
+                col3.metric(p2, v2, round(v2-v1, 2))
+        else:
+            st.info("Need at least 2 players for comparison.")
+
+    st.markdown(f'<div style="text-align: center; color: #444; padding: 20px;">© 2026 BPL PRO {tier} HUB</div>', unsafe_allow_html=True)
